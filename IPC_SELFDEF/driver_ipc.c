@@ -11,19 +11,55 @@
 #include <linux/pid_namespace.h>
 #include <linux/security.h>
 
-//trasaction between client and server
-struct xyf_transaction {
-    int pid;
-    int data;
+struct svcinfo
+{
+    struct svcinfo *next;
+    int handle;
+    size_t len;
+    char name[10];
 };
 
-#define SET_AS_SERVER _IOW('x', 7, __s32)
-#define SERVER_ENTER_LOOP _IOWR('x', 8, struct xyf_transaction)
-#define SERVER_REPLY _IOWR('x', 9, struct xyf_transaction)
-#define CLIENT_REQUEST _IOWR('x', 10, struct xyf_transaction)
+struct svcinfo *svclist = NULL;
+struct svcinfo *find_svc(char *name, size_t len){
+    struct svcinfo *si;
+    for(si = svclist; si; si = si->next){
+        if((len == si->len) && !memcmp(name, si->name, len*sizeof(char))){
+            return si;
+        }
+    }
+    return NULL;
+}
+
+int add_service(char *name, int handle,size_t len){
+    struct svcinfo *si;
+    
+    si = (struct svcinfo *)kzalloc(sizeof(*si),GFP_KERNEL);
+    si->handle = handle;
+    si->len = len;
+    memcpy(si->name, name, 10*sizeof(char));
+    si->next = svclist;
+    svclist = si;
+    return 0;
+}
+
+//trasaction between client and server
+struct xyf_write_read{
+    char name[10];
+    size_t len;
+    int out_handle;//from kernel to user space
+    int in_handle; //from user space to kernel
+    int data;
+    int pid;
+};
+
+#define REGISTER_SERVICE _IOWR('x', 11, struct xyf_write_read)
+#define GET_SERVICE _IOWR('x', 12, struct xyf_write_read)
+#define SERVER_ENTER_LOOP _IOWR('x', 13, struct xyf_write_read)
+#define SERVER_REPLY _IOWR('x', 14, struct xyf_write_read)
+#define CLIENT_REQUEST _IOWR('x', 15, struct xyf_write_read)
 
 //notify and save data
-struct xyf_device
+struct binder_proc
 {
     struct hlist_node list_node;
     int pid;
@@ -36,23 +72,8 @@ struct xyf_device
 
 static HLIST_HEAD(xyf_list);//struct hlist_head
 
-static void show(struct xyf_device *device)
-{
-    printk("pid=%d handle=%d.\n", device->pid, device->handle);
-}
-
-static struct xyf_device * find_server(void){
-    struct xyf_device *item;
-    hlist_for_each_entry(item, &xyf_list, list_node){
-        if(item->handle == 0){
-            return item;
-        }
-    }
-    return NULL;
-}
-
-static struct xyf_device * find_client(int handle){
-    struct xyf_device *item;
+static struct binder_proc * find_target(int handle){
+    struct binder_proc *item;
     hlist_for_each_entry(item, &xyf_list, list_node){
         if(item->handle == handle){
             return item;
@@ -61,103 +82,10 @@ static struct xyf_device * find_client(int handle){
     return NULL;
 }
 
-static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
-    struct xyf_device *server;
-    struct xyf_device *client;
-    struct xyf_device *device = filp->private_data;
-    void __user *ubuf = (void __user *)arg;
-    struct xyf_transaction xyf_data;
-    
-    printk("xyf_ioctl cmd: %d\n", cmd);
-
-    switch (cmd) {
-        case SERVER_ENTER_LOOP:{//server
-            struct xyf_transaction __user *xyf = ubuf;
-            device->data = 0;
-            printk("xyf_ioctl server enter loop...\n");
-            if (wait_event_interruptible(device->wait, (device->data != 0))){
-                return 0;
-            }
-            printk("xyf_ioctl server get data from client %d\n", device->data);
-            if (put_user(device->data, &xyf->data)) {
-                return -EINVAL;
-            }
-            if (put_user(device->target_pid, &xyf->pid)) {
-                return -EINVAL;
-            }
-            return 0;
-        }
-        case CLIENT_REQUEST:{//client request
-            struct xyf_transaction __user *xyf_return = ubuf;
-            device->data = 0;
-            //target is server,there is onley one server
-            device->target = 0;
-            if (copy_from_user(&xyf_data, ubuf, sizeof(struct xyf_transaction))){
-                return -EFAULT;
-            }
-            //server = hlist_entry(xyf_list.first->next, struct xyf_device, list_node);
-            server = find_server();
-
-            if(server == NULL){
-                printk("xyf_ioctl cannot find server.\n");
-                return 0;
-            }
-            device->target_pid = server->pid;
-            
-            server->data = xyf_data.data;
-            server->target = device->handle;
-            server->target_pid = device->pid;
-            wake_up_interruptible(&server->wait);
-            printk("xyf_ioctl client wake up server: %d,pid=%d,data=%d.\n",
-                   server->handle,server->pid,server->data);
-            
-            //wait for server response
-            printk("xyf_ioctl client waiting on %d.\n", device->handle);
-            if (wait_event_interruptible(device->wait, (device->data != 0))){
-                return 0;
-            }
-            
-            printk("xyf_ioctl client response from server %d.\n", device->data);
-            if (put_user(device->data, &xyf_return->data)) {
-                return -EINVAL;
-            }
-            if (put_user(device->target_pid, &xyf_return->pid)) {
-                return -EINVAL;
-            }
-            return 0;
-        }
-        case SERVER_REPLY:{//server response
-            printk("xyf_ioctl server response.\n");
-            if (copy_from_user(&xyf_data, ubuf, sizeof(struct xyf_transaction))){
-                return -EFAULT;
-            }
-
-            client = find_client(device->target);
-            if(client == NULL){
-                printk("xyf_ioctl cannot find client.\n");
-                return 0;
-            }
-            client->data = xyf_data.data;
-            printk("xyf_ioctl wake up client %d.\n", client->handle);
-            wake_up_interruptible(&client->wait);
-            return 0;
-        }
-        case SET_AS_SERVER:{
-            device->handle = 0;
-            device->data = 0;
-            printk("xyf_ioctl set as server %d.\n", device->handle);
-            break;
-        }
-        default:
-            break;
-    }
-    return 0;
-}
-
 static int generate_handle(void){
     int handle;
     int count;
-    struct xyf_device *item;
+    struct binder_proc *item;
     
     handle = 0;
     count = 0;
@@ -165,43 +93,152 @@ static int generate_handle(void){
     hlist_for_each_entry(item, &xyf_list, list_node){
         count++;
     }
-    if(count == 0){
-        handle = 0;//server handle
-    }else{
-        handle = count;
+    if(count > 1){
+        handle = count - 1;
     }
     return handle;
 }
 
+static int notify_target(struct binder_proc *source,struct xyf_write_read *bwr){
+    struct binder_proc *target = find_target(bwr->in_handle);
+    if(target == NULL){
+        printk("xyf_ioctl cannot find target %d.\n",bwr->in_handle);
+        return -1;
+    }
+    //put data to server buffer, can user other ways
+    target->data = bwr->data;
+            
+    target->target = source->handle;
+    target->target_pid = source->pid;
+    wake_up_interruptible(&target->wait);
+    return 0;
+}
+
+static int get_handle(struct xyf_write_read *bwr){
+    struct svcinfo * service = find_svc(bwr->name, bwr->len);
+    if(service != NULL){
+        return service->handle;
+    }else{
+        printk("xyf_ioctl cannot find handle %s\n", bwr->name);
+        return -1;
+    }
+}
+
+static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
+    int result, handle;
+    struct xyf_write_read bwr;
+    void __user *ubuf = (void __user *)arg;
+    struct binder_proc *device = filp->private_data;
+    
+    printk("xyf_ioctl cmd: %d\n", cmd);
+
+    switch (cmd) {
+        case SERVER_ENTER_LOOP:{//server
+            struct xyf_write_read __user *reply = ubuf;
+            device->data = 0;
+            
+            printk("xyf_ioctl server enter loop...\n");
+            if (wait_event_interruptible(device->wait, (device->data != 0))){
+                return 0;
+            }
+            printk("xyf_ioctl server get data from client %d\n", device->data);
+            if (put_user(device->data, &reply->data)) {
+                return -EINVAL;
+            }
+            if (put_user(device->target_pid, &reply->pid)) {
+                return -EINVAL;
+            }
+            if (put_user(device->target, &reply->out_handle)) {
+                return -EINVAL;
+            }
+            return 0;
+        }
+        case CLIENT_REQUEST:{//client request
+            struct xyf_write_read __user *reply = ubuf;
+            device->data = 0;
+            
+            if (copy_from_user(&bwr, ubuf, sizeof(struct xyf_write_read))){
+                return -EFAULT;
+            }
+            result = notify_target(device, &bwr);
+            if(result == -1){
+                return 0;
+            }
+            //wait for server response
+            printk("xyf_ioctl client waiting on %d.\n", device->handle);
+            if (wait_event_interruptible(device->wait, (device->data != 0))){
+                return 0;
+            }
+            
+            printk("xyf_ioctl client response from server %d.\n", device->data);
+
+            if (put_user(device->data, &reply->data)) {
+                return -EINVAL;
+            }
+            if (put_user(device->target_pid, &reply->pid)) {
+                return -EINVAL;
+            }
+            return 0;
+        }
+        case SERVER_REPLY:{//server response
+            printk("xyf_ioctl server response.\n");
+            if (copy_from_user(&bwr, ubuf, sizeof(struct xyf_write_read))){
+                return -EFAULT;
+            }
+
+            result = notify_target(device, &bwr);
+            if(result == -1){
+                return 0;
+            }
+            return 0;
+        }
+        case REGISTER_SERVICE:{
+            if (copy_from_user(&bwr, ubuf, 
+                        sizeof(struct xyf_write_read))){
+                return -EFAULT;
+            }
+            device->handle = generate_handle();
+            device->data = 0;
+            add_service(bwr.name, 
+                        device->handle,
+                        bwr.len);
+            
+            printk("xyf_ioctl add service %s, len = %d\n", 
+                   bwr.name, (int)(bwr.len));
+            return 0;
+        }
+        case GET_SERVICE:{
+            struct xyf_write_read __user *reply = ubuf;
+            
+            if (copy_from_user(&bwr, ubuf, sizeof(struct xyf_write_read))){
+                return -EFAULT;
+            }
+            handle = get_handle(&bwr);
+            if (put_user(handle, &reply->out_handle)) {
+                return -EINVAL;
+            }
+            return 0;
+        }
+        default:
+            break;
+    }
+    return 0;
+}
+
 static int xyf_open(struct inode *nodp, struct file *filp)
 {
-    struct xyf_device *device;
-    struct xyf_device *item;
-    int handle;
-    device = (struct xyf_device *)kzalloc(sizeof(*device), GFP_KERNEL);
+    struct binder_proc *device;
+
+    device = (struct binder_proc *)kzalloc(sizeof(*device), GFP_KERNEL);
     if (device == NULL){
         printk("xyf_open kzalloc failed.\n");
         return -ENOMEM;
     }
     init_waitqueue_head(&device->wait);
-    if(hlist_empty(&xyf_list)){
-        device->handle = 0;
-    }else{
-        handle = generate_handle();
-        printk("xyf_open generate handle %d.\n", handle);
-        device->handle = handle;
-    }
-    device->target = -1;
-    device->target_pid = 0;
     hlist_add_head(&device->list_node, &xyf_list);
-    device->data = 0;
     device->pid = current->pid;
     filp->private_data = device;
-    printk("xyf_open finished %d.\n", device->pid);
-
-    hlist_for_each_entry(item, &xyf_list, list_node){
-        show(item);
-    }
+    printk("xyf_open %d.\n", device->pid);
     return 0;
 }
 
