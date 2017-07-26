@@ -4,6 +4,7 @@
 #include <sys/ioctl.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 struct xyf_write_read{
     char name[10];
@@ -64,7 +65,7 @@ int main() {
         int handle = get_service_handle(fd);
         calc(fd, handle);
     }
-
+    
     return 0;
 }
 
