@@ -22,7 +22,7 @@ struct xyf_write_read{
     int data;
     int pid;
 };
-//present a service
+//present a service,create a node by register_service
 struct binder_node
 {
     struct binder_node *next;
@@ -76,9 +76,9 @@ int register_service(struct binder_proc *proc,char *name,
     proc->nodes = node;
     return 0;
 }
-static int handle_index = 0;
+
 static int generate_handle(void){
-    /*
+    
     struct binder_proc *item;
     struct binder_node *node;
     int count = 0;
@@ -92,13 +92,7 @@ static int generate_handle(void){
             count++;
         }
     }
-
-    if(count >= 1){
-        return count - 1;
-    }
-    return count;*/
-    int count = handle_index;
-    handle_index++;
+    printk("xyf_ioctl generate_handle count:%d\n", count);
     return count;
     
 }
@@ -260,7 +254,6 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
             if (put_user(transaction->to_handle, &reply->out_handle)) {
                 return -EINVAL;
             }
-
             return 0;
         }
         case CLIENT_REQUEST:{//client request
@@ -289,6 +282,8 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
             if (put_user(transaction->data, &reply->data)) {
                 return -EINVAL;
             }
+            kfree(transaction);
+            thread->transaction = NULL;
             return 0;
         }
         case SERVER_REPLY:{//server response
