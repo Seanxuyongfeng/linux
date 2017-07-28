@@ -23,15 +23,14 @@ int handle_service_b = -1;
 #define SERVER_ENTER_LOOP _IOWR('x', 13, struct xyf_write_read)
 #define SERVER_REPLY _IOWR('x', 14, struct xyf_write_read)
 #define CLIENT_REQUEST _IOWR('x', 15, struct xyf_write_read)
-
+#define BC_REQUEST_DEATH_NOTIFICATION _IOWR('x', 16, struct xyf_write_read) 
+#define PROC_ENTER_LOOP _IOWR('x', 17, struct xyf_write_read) 
 
 static void listening(int fd){
     struct xyf_write_read xyf_data;
     int result = ioctl(fd, SERVER_ENTER_LOOP, &xyf_data);
     printf("a_service receive data=%d \n", xyf_data.data);
     xyf_data.in_handle = xyf_data.out_handle;
-    char a_service[10]="a_service";
-    char b_service[10]="b_service";
     if(handle_service_a == xyf_data.out_handle){
         printf("request a_service\n");
         xyf_data.data = xyf_data.data + 10;
@@ -141,6 +140,42 @@ static void register_b_service(int fd){
     }
 }
 
+static int get_c_service_handle(int fd){
+    struct xyf_write_read xyf_data;
+    char a_service[10]="c_service";
+    memset(&xyf_data, 0x00, sizeof(struct xyf_write_read));
+    memcpy(&xyf_data.name, a_service, 10);
+    xyf_data.len = 9;
+    ioctl(fd, GET_SERVICE, &xyf_data);
+    printf("get service handle=%d\n", xyf_data.out_handle);
+    return xyf_data.out_handle;
+}
+
+static void calc(int fd, int handle){
+    struct xyf_write_read xyf_data;
+    memset(&xyf_data, 0x00, sizeof(struct xyf_write_read));
+    xyf_data.in_handle = handle;
+    xyf_data.data = 76;
+    ioctl(fd, CLIENT_REQUEST, &xyf_data);
+    printf("get reply =%d \n", xyf_data.data);
+}
+
+static void linkToDeath(int fd, int target_fd){
+    struct xyf_write_read xyf_data;
+    memset(&xyf_data, 0x00, sizeof(struct xyf_write_read));
+    xyf_data.in_handle = target_fd;
+    ioctl(fd, BC_REQUEST_DEATH_NOTIFICATION, &xyf_data);
+    printf("listering service %d \n", target_fd);
+}
+
+static void main_loop(int fd){
+    struct xyf_write_read xyf_data;
+    memset(&xyf_data, 0x00, sizeof(struct xyf_write_read));
+    int result = ioctl(fd, PROC_ENTER_LOOP, &xyf_data);
+    int death_handle = xyf_data.out_handle;
+    printf("target service %d died\n", death_handle);
+}
+
 int main() {
     int fd = open_driver();
     mDriverFD = fd;
@@ -149,8 +184,15 @@ int main() {
         register_b_service(fd);
         papare_looper();
     }
+    //waiting service c to register
+    sleep(5);
+    
+    int handle = get_c_service_handle(fd);
+    calc(fd, handle);
+
+    linkToDeath(mDriverFD, handle);
     while(1){
-        sleep(5);
+        main_loop(mDriverFD);
     }
     return 0;
 }
