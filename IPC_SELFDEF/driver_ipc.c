@@ -10,18 +10,27 @@
 #include <linux/sched.h>
 #include <linux/pid_namespace.h>
 #include <linux/security.h>
+#include <linux/vmalloc.h>
 
 static HLIST_HEAD(xyf_list);//struct hlist_head
 
-//trasaction between client and server
-struct xyf_write_read{
-    char name[10];
-    size_t len;
-    int out_handle;//from kernel to user space
-    int in_handle; //from user space to kernel
+struct transaction_data{
+    int handle;
     int data;
     int pid;
 };
+
+//user to send data to kernel
+struct xyf_write_read{
+    char name[10];
+    size_t len;
+    int in_handle; //from user space to kernel
+    int data;//from user space to kernel
+    int pid;//from user space to kernel
+    //user space can read from this buffer which created by kernel
+    unsigned long read_buffer;
+};
+
 //present a service,create a node by register_service
 struct binder_node
 {
@@ -34,10 +43,10 @@ struct binder_node
 //present a ipc transaction from client to server
 struct binder_transaction{
     struct binder_thread *from;
+    struct binder_proc *from_proc;
     struct binder_proc *to_proc;
     struct binder_thread* to_thread;
-    int data;
-    int to_handle;
+    int reply;
 };
 
 //present thread wait for,client or server
@@ -63,6 +72,8 @@ struct binder_proc
     int waiting_handle;//for death notify
     struct binder_death *deaths;//each proc has its waiting list
     wait_queue_head_t wait;
+    void *buffer;
+    unsigned long vm_start;
 };
 
 struct binder_transaction *create_transaction(void){
@@ -219,17 +230,20 @@ static struct binder_proc *find_proc(int handle){
     return NULL;
 }
 
-static int notify_server(struct binder_thread *source, struct xyf_write_read *bwr){
+static int notify_server(struct binder_proc *from_proc,
+                         struct binder_thread *source, 
+                         struct xyf_write_read *bwr){
     struct binder_thread *to_thread = NULL;
     struct binder_transaction *transaction = NULL;
     struct binder_thread *from = NULL;
+    struct transaction_data* data = NULL;
     struct binder_proc *to_proc = find_proc(bwr->in_handle);
     
     if(to_proc == NULL){
         printk("xyf_ioctl cannot find service %d.\n",bwr->in_handle);
         return -1;
     }
-    
+    data = (struct transaction_data*)(to_proc->buffer);
     to_thread = pickup_thread(to_proc);
     transaction = create_transaction();
     from = source;
@@ -238,26 +252,32 @@ static int notify_server(struct binder_thread *source, struct xyf_write_read *bw
 
     to_thread->transaction = transaction;
     transaction->from = from;
+    transaction->from_proc = from_proc;
     transaction->to_proc = to_proc;
     transaction->to_thread = to_thread;
-    transaction->data = bwr->data;
-    transaction->to_handle = bwr->in_handle;
-    printk("xyf_ioctl notify_server %ld:%d.\n",(long)transaction, transaction->data);
+    transaction->reply = 0;
+    data->data = bwr->data;
+    data->handle = bwr->in_handle;
+    printk("xyf_ioctl notify_server %ld:%d.\n",(long)transaction, data->data);
     wake_up_interruptible(&to_thread->wait);
     return 0;
 }
 
 static int notify_client(struct binder_thread *source,struct xyf_write_read *bwr){
     struct binder_thread *from = NULL;
+    struct transaction_data *data =NULL;
+    struct binder_proc *from_proc = NULL;
     struct binder_transaction *transaction = source->transaction;
+
     if(transaction == NULL){
         printk("xyf_ioctl no transaction.\n");
         return -1;
     }
-    
-    transaction->data = bwr->data;
+    from_proc = transaction->from_proc;
+    data = (struct transaction_data *)(from_proc->buffer);
+    data->data = bwr->data;
     from = transaction->from;
-
+    transaction->reply = 1;
     wake_up_interruptible(&from->wait);
     return 0;
 }
@@ -293,9 +313,7 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
     }
     switch (cmd) {
         case SERVER_ENTER_LOOP:{//server
-            struct binder_transaction * transaction = NULL;
             struct xyf_write_read __user *reply = ubuf;
-            
             printk("xyf_ioctl server enter loop:%d...\n",current->pid);
             if(thread == NULL){
                 return 0;
@@ -304,18 +322,7 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
             if (wait_event_interruptible(thread->wait, (thread->transaction != NULL))){
                 return 0;
             }
-            transaction = thread->transaction;
-            if(transaction == NULL){
-                printk("xyf_ioctl no transaction in server\n");
-                return 0;
-            }
-            printk("xyf_ioctl server get data from client %ld:%d\n", (long)transaction,transaction->data);
-            
-            if (put_user(transaction->data, &reply->data)) {
-                return -EINVAL;
-            }
-            //tell which service to visit in server
-            if (put_user(transaction->to_handle, &reply->out_handle)) {
+            if (put_user(proc->vm_start, &reply->read_buffer)) {
                 return -EINVAL;
             }
             return 0;
@@ -323,6 +330,7 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
         case CLIENT_REQUEST:{//client request
             struct xyf_write_read __user *reply = ubuf;
             struct binder_transaction *transaction = NULL;
+            struct transaction_data* data = (struct transaction_data*)(proc->buffer);
             if(thread == NULL){
                 return 0;
             }
@@ -330,22 +338,27 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
                 return -EFAULT;
             }
             
-            result = notify_server(thread, &bwr);
+            result = notify_server(proc, thread, &bwr);
             if(result == -1){
                 return 0;
             }
             //wait for server response
             printk("xyf_ioctl client waiting... \n");
             if (wait_event_interruptible(thread->wait, 
-                        (thread->transaction->data != bwr.data))){
+                        (thread->transaction->reply != 0))){
                 return 0;
             }
-            transaction = thread->transaction;
-            printk("xyf_ioctl client response from server %d.\n", transaction->data);
 
-            if (put_user(transaction->data, &reply->data)) {
+            printk("xyf_ioctl client response from server %d.\n", data->data);
+
+            if (put_user(proc->vm_start, &reply->read_buffer)) {
                 return -EINVAL;
             }
+            /*
+            if (put_user(transaction->data, &reply->data)) {
+                return -EINVAL;
+            }*/
+
             kfree(transaction);
             thread->transaction = NULL;
             return 0;
@@ -367,6 +380,7 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
         }
         case REGISTER_SERVICE:{
             struct xyf_write_read __user *reply = ubuf;
+            struct transaction_data* data = (struct transaction_data*)(proc->buffer);
             if (copy_from_user(&bwr, ubuf, 
                         sizeof(struct xyf_write_read))){
                 return -EFAULT;
@@ -374,7 +388,8 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
             handle = generate_handle();
             printk("xyf_ioctl generate_handle %d\n", handle);
             register_service(proc, bwr.name, handle, bwr.len);
-            if (put_user(handle, &reply->out_handle)) {
+            data->handle = handle;
+            if (put_user(proc->vm_start, &reply->read_buffer)) {
                 return -EINVAL;
             }
             printk("xyf_ioctl add service %s, len = %d:%d\n", 
@@ -383,14 +398,19 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
         }
         case GET_SERVICE:{
             struct xyf_write_read __user *reply = ubuf;
-            
+            struct transaction_data* data = (struct transaction_data*)(proc->buffer);
             if (copy_from_user(&bwr, ubuf, sizeof(struct xyf_write_read))){
                 return -EFAULT;
             }
             handle = get_handle(&bwr);
-            if (put_user(handle, &reply->out_handle)) {
+            data->handle = handle;
+            if (put_user(proc->vm_start, &reply->read_buffer)) {
                 return -EINVAL;
             }
+            /*
+            if (put_user(handle, &reply->out_handle)) {
+                return -EINVAL;
+            }*/
             return 0;
         }
         case BC_REQUEST_DEATH_NOTIFICATION:{
@@ -402,6 +422,7 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
         }
         case PROC_ENTER_LOOP:{
             struct xyf_write_read __user *reply = ubuf;
+            struct transaction_data* data = (struct transaction_data*)(proc->buffer);
             proc->waiting_handle = -1;
             if (wait_event_interruptible(proc->wait, (proc->waiting_handle != -1))){
                 return 0;
@@ -410,9 +431,14 @@ static long xyf_ioctl(struct file *filp, unsigned int cmd, unsigned long arg){
             if(result == -1){
                 return 0;
             }
-            if (put_user(proc->waiting_handle, &reply->out_handle)) {
+            data->handle = proc->waiting_handle;
+            if (put_user(proc->vm_start, &reply->read_buffer)) {
                 return -EINVAL;
             }
+            /*
+            if (put_user(proc->waiting_handle, &reply->out_handle)) {
+                return -EINVAL;
+            }*/
             return 0;
         }
         default:
@@ -513,11 +539,28 @@ static int xyf_open(struct inode *nodp, struct file *filp)
     return 0;
 }
 
+static int binder_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    unsigned long page;
+    struct binder_proc *proc = filp->private_data;
+    unsigned long length = vma->vm_end - vma->vm_start;
+
+    proc->buffer = kzalloc(length, GFP_KERNEL);
+    proc->vm_start = vma->vm_start;
+    page = virt_to_phys(proc->buffer);
+    if(remap_pfn_range(vma,vma->vm_start,page>>PAGE_SHIFT,length,PAGE_SHARED)){
+        printk("mmap failed...");
+        return -1;
+    }
+    return 0;
+}
+
 static const struct file_operations xyf_fops = {
 	.owner = THIS_MODULE,
 	.unlocked_ioctl = xyf_ioctl,
 	.compat_ioctl = xyf_ioctl,
 	.open = xyf_open,
+    .mmap = binder_mmap,
     .release = xyf_release,
 };
 

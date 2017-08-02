@@ -5,14 +5,23 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/mman.h>
 
+struct transaction_data{
+    int handle;
+    int data;
+    int pid;
+};
+
+//user to send data to kernel
 struct xyf_write_read{
     char name[10];
     size_t len;
-    int out_handle;//from kernel to user space
     int in_handle; //from user space to kernel
-    int data;
-    int pid;
+    int data;//from user space to kernel
+    int pid;//from user space to kernel
+    //user space can read from this buffer which created by kernel
+    unsigned long read_buffer;
 };
 static int mDriverFD = 0;
 int handle_service_a = -1;
@@ -29,16 +38,22 @@ int handle_service_b = -1;
 static void listening(int fd){
     struct xyf_write_read xyf_data;
     int result = ioctl(fd, SERVER_ENTER_LOOP, &xyf_data);
-    printf("a_service receive data=%d \n", xyf_data.data);
-    xyf_data.in_handle = xyf_data.out_handle;
-    if(handle_service_a == xyf_data.out_handle){
+    int service_handle = -1;
+    int receive_data = -1;
+    struct transaction_data * data = (struct transaction_data *)(xyf_data.read_buffer);
+    receive_data = data->data;
+    service_handle = data->handle;
+    
+    printf("a_service receive data=%d \n", receive_data);
+    
+    if(handle_service_a == service_handle){
         printf("request a_service\n");
-        xyf_data.data = xyf_data.data + 10;
-    }else if(handle_service_b == xyf_data.out_handle){
+        xyf_data.data = receive_data + 10;
+    }else if(handle_service_b == service_handle){
         printf("request b_service\n");
-        xyf_data.data = xyf_data.data + 20;
+        xyf_data.data = receive_data + 20;
     }else{
-        printf("server no such a service %d\n", xyf_data.out_handle);
+        printf("server no such a service %d\n", service_handle);
     }
     
     result = ioctl(fd, SERVER_REPLY, &xyf_data);
@@ -110,6 +125,15 @@ static int open_driver(){
     return fd;
 }
 
+#define BINDER_VM_SIZE ((1*1024*1024) - (4096 *2))
+
+static int mmap(int fd){
+    if(mmap(0, BINDER_VM_SIZE, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, fd, 0) == MAP_FAILED){
+        printf("mmap failed!!! \n");
+    }
+    return 0;
+}
+
 static void register_a_service(int fd){
     if(fd >= 0){
          char name[10]="a_service";
@@ -118,7 +142,8 @@ static void register_a_service(int fd){
          memcpy(&xyf.name, name, 10);
          xyf.len = 9;
          int result = ioctl(fd, REGISTER_SERVICE, &xyf);
-         handle_service_a = xyf.out_handle;
+         struct transaction_data * data = (struct transaction_data *)(xyf.read_buffer);
+         handle_service_a = data->handle;
          printf("register %s, handle=%d\n", name, handle_service_a);
     }else{
         printf("Opening '/dev/xyf' failed: %s\n", strerror(errno));
@@ -133,7 +158,11 @@ static void register_b_service(int fd){
          memcpy(&xyf.name, name, 10);
          xyf.len = 9;
          int result = ioctl(fd, REGISTER_SERVICE, &xyf);
-         handle_service_b = xyf.out_handle;
+         if(xyf.read_buffer != 0){
+             struct transaction_data * data = (struct transaction_data *)(xyf.read_buffer);
+             handle_service_b = data->handle;
+             printf("registerbbb %s, handle=%d\n", name, data->handle);
+         }
          printf("register %s, handle=%d\n", name, handle_service_b);
     }else{
         printf("Opening '/dev/xyf' failed: %s\n", strerror(errno));
@@ -147,8 +176,12 @@ static int get_c_service_handle(int fd){
     memcpy(&xyf_data.name, a_service, 10);
     xyf_data.len = 9;
     ioctl(fd, GET_SERVICE, &xyf_data);
-    printf("get service handle=%d\n", xyf_data.out_handle);
-    return xyf_data.out_handle;
+    
+    int service_c_handle = -1;
+    struct transaction_data * data = (struct transaction_data *)(xyf_data.read_buffer);
+    service_c_handle = data->handle;
+    printf("get service c handle=%d\n", service_c_handle);
+    return service_c_handle;
 }
 
 static void calc(int fd, int handle){
@@ -157,7 +190,12 @@ static void calc(int fd, int handle){
     xyf_data.in_handle = handle;
     xyf_data.data = 76;
     ioctl(fd, CLIENT_REQUEST, &xyf_data);
-    printf("get reply =%d \n", xyf_data.data);
+    
+    int receive_data = -1;
+    struct transaction_data * data = (struct transaction_data *)(xyf_data.read_buffer);
+    receive_data = data->data;
+    
+    printf("get reply from service c =%d \n", receive_data);
 }
 
 static void linkToDeath(int fd, int target_fd){
@@ -172,7 +210,10 @@ static void main_loop(int fd){
     struct xyf_write_read xyf_data;
     memset(&xyf_data, 0x00, sizeof(struct xyf_write_read));
     int result = ioctl(fd, PROC_ENTER_LOOP, &xyf_data);
-    int death_handle = xyf_data.out_handle;
+    
+    struct transaction_data * data = (struct transaction_data *)(xyf_data.read_buffer);
+        
+    int death_handle = data->handle;
     printf("target service %d died\n", death_handle);
 }
 
@@ -180,6 +221,7 @@ int main() {
     int fd = open_driver();
     mDriverFD = fd;
     if(fd >= 0){
+        mmap(fd);
         register_a_service(fd);
         register_b_service(fd);
         papare_looper();

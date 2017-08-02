@@ -5,14 +5,23 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
+#include <sys/mman.h>
 
+struct transaction_data{
+    int handle;
+    int data;
+    int pid;
+};
+
+//user to send data to kernel
 struct xyf_write_read{
     char name[10];
     size_t len;
-    int out_handle;//from kernel to user space
     int in_handle; //from user space to kernel
-    int data;
-    int pid;
+    int data;//from user space to kernel
+    int pid;//from user space to kernel
+    //user space can read from this buffer which created by kernel
+    unsigned long read_buffer;
 };
 
 #define REGISTER_SERVICE _IOWR('x', 11, struct xyf_write_read)
@@ -44,7 +53,8 @@ static int register_as_server(){
          memcpy(&xyf.name, name, 10);
          xyf.len = 8;
          int result = ioctl(fd, REGISTER_SERVICE, &xyf);
-         printf("register %s, result=%d\n", name, result);
+         
+         printf("register %s, handle=%d\n", name, result);
     }else{
         printf("Opening '/dev/xyf' failed: %s\n", strerror(errno));
     }
@@ -58,8 +68,11 @@ static int get_a_service_handle(int fd){
     memcpy(&xyf_data.name, a_service, 10);
     xyf_data.len = 9;
     ioctl(fd, GET_SERVICE, &xyf_data);
-    printf("get service handle=%d\n", xyf_data.out_handle);
-    return xyf_data.out_handle;
+    struct transaction_data * data = (struct transaction_data *)(xyf_data.read_buffer);
+    int receive_handle = data->handle;
+    
+    printf("get service a handle=%d\n", receive_handle);
+    return receive_handle;
 }
 
 static void calc(int fd, int handle){
@@ -68,7 +81,22 @@ static void calc(int fd, int handle){
     xyf_data.in_handle = handle;
     xyf_data.data = 56;
     ioctl(fd, CLIENT_REQUEST, &xyf_data);
-    printf("get reply =%d \n", xyf_data.data);
+    
+    struct transaction_data * data = (struct transaction_data *)(xyf_data.read_buffer);
+    int receive_data = data->data;
+    
+    printf("get reply =%d \n", receive_data);
+}
+
+#define BINDER_VM_SIZE ((1*1024*1024) - (4096 *2))
+
+static int mmap(int fd){
+    if(mmap(0, BINDER_VM_SIZE, PROT_READ, MAP_PRIVATE | MAP_NORESERVE, fd, 0) == MAP_FAILED){
+        printf("mmap failed!!! \n");
+    }else{
+        printf("mmap success!!! \n");
+    }
+    return 0;
 }
 
 int handle_service_c = 0;
@@ -80,8 +108,12 @@ static void register_c_service(int fd){
          memset(&xyf, 0x00, sizeof(struct xyf_write_read));
          memcpy(&xyf.name, name, 10);
          xyf.len = 9;
+         printf("register_c_service \n");
          int result = ioctl(fd, REGISTER_SERVICE, &xyf);
-         handle_service_c = xyf.out_handle;
+         
+         struct transaction_data * data = (struct transaction_data *)(xyf.read_buffer);
+         
+         handle_service_c = data->handle;
          printf("register %s, handle=%d\n", name, handle_service_c);
     }else{
         printf("Opening '/dev/xyf' failed: %s\n", strerror(errno));
@@ -90,14 +122,18 @@ static void register_c_service(int fd){
 
 static void listening(int fd){
     struct xyf_write_read xyf_data;
+    printf("listening... \n");
     int result = ioctl(fd, SERVER_ENTER_LOOP, &xyf_data);
-    printf("c_service receive data=%d \n", xyf_data.data);
-    xyf_data.in_handle = xyf_data.out_handle;
-    if(handle_service_c == xyf_data.out_handle){
+    struct transaction_data * data = (struct transaction_data *)(xyf_data.read_buffer);
+    int receive_data = data->data;
+    printf("c_service receive data=%d \n", receive_data);
+    int receive_handle = data->handle;
+    
+    if(handle_service_c == receive_handle){
         printf("request c_service\n");
-        xyf_data.data = xyf_data.data + 30;
+        xyf_data.data = receive_data + 30;
     }else{
-        printf("server no such a service %d\n", xyf_data.out_handle);
+        printf("server no such a service %d\n", receive_handle);
     }
     
     result = ioctl(fd, SERVER_REPLY, &xyf_data);
@@ -124,6 +160,7 @@ static void papare_looper(){
 int main() {
     mDriverFD = open_driver(); 
     if(mDriverFD >= 0){
+        mmap(mDriverFD);
         register_c_service(mDriverFD);
         papare_looper();
         //waiting service a to register
